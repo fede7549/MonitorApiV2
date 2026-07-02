@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="es">
+<head>
+    <meta charset="utf-8">
+    <title>Monitor Papá</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+    <div class="container py-4">
+        <h1 class="mb-4 text-center">Monitor Papá</h1>
+
+        <div id="alerta" class="alert alert-secondary text-center fs-4 fw-bold">Cargando...</div>
+
+        <div class="card shadow-sm mb-3">
+            <div class="card-header fw-bold">Dispositivos a conectar</div>
+            <div class="card-body">
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input device-check" type="checkbox" id="chkOximetro">
+                    <label class="form-check-label" for="chkOximetro">Oxímetro</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input device-check" type="checkbox" id="chkWt901">
+                    <label class="form-check-label" for="chkWt901">WT901</label>
+                </div>
+                <div class="form-check form-check-inline">
+                    <input class="form-check-input device-check" type="checkbox" id="chkRing">
+                    <label class="form-check-label" for="chkRing">Ring / anillo inteligente</label>
+                </div>
+                <div class="small text-muted mt-2" id="estadoDispositivos">--</div>
+            </div>
+        </div>
+
+        <div class="text-center mb-3">
+            <button id="btnAudio" class="btn btn-danger btn-lg" onclick="activarAudio()">Activar sonido</button>
+            <button class="btn btn-secondary btn-lg ms-2" onclick="silenciar5Min()">Silenciar 5 min</button>
+        </div>
+
+        <div class="row g-3">
+            <div class="col-md-4">
+                <div class="card shadow-sm h-100">
+                    <div class="card-header fw-bold">Oxímetro</div>
+                    <div class="card-body text-center">
+                        <div class="display-3 fw-bold" id="spo2">--%</div>
+                        <div class="fs-3">Pulso: <span id="pulso">--</span> bpm</div>
+                        <div class="mt-2" id="estadoOximetro">--</div>
+                        <small id="ultimaOximetro" class="text-muted">--</small>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-4">
+                <div class="card shadow-sm h-100">
+                    <div class="card-header fw-bold">Postura WT901</div>
+                    <div class="card-body text-center">
+                        <div class="display-5 fw-bold" id="postura">--</div>
+                        <div class="mt-3">
+                            Pitch: <span id="pitch">--</span><br>
+                            Roll: <span id="roll">--</span><br>
+                            Yaw: <span id="yaw">--</span><br>
+                            Batería raw: <span id="bateriaWt901">--</span>
+                        </div>
+                        <div class="mt-2" id="estadoWt901">--</div>
+                        <small id="ultimaWt901" class="text-muted">--</small>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-4">
+                <div class="card shadow-sm h-100">
+                    <div class="card-header fw-bold">Ring / anillo inteligente</div>
+                    <div class="card-body text-center">
+                        <div class="display-3 fw-bold" id="ringSpo2">--%</div>
+                        <div class="fs-3">Pulso: <span id="ringPulso">--</span> bpm</div>
+                        <div>Batería: <span id="ringBateria">--</span></div>
+                        <div>Lecturas: <span id="ringLecturas">--</span></div>
+                        <div class="mt-2" id="estadoRing">--</div>
+                        <small id="ultimaRing" class="text-muted">--</small>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card shadow-sm mt-3">
+            <div class="card-header fw-bold">JSON actual</div>
+            <div class="card-body"><pre id="json" class="mb-0 small">Cargando...</pre></div>
+        </div>
+    </div>
+
+    <script>
+        let audioActivo = false;
+        let ultimoSonido = 0;
+        let silenciadoHasta = 0;
+        let supinoDesde = null;
+        let guardandoDispositivos = false;
+
+        const SUPINO_CONFIRM_MS = 20000;
+
+        const sonidos = {
+            OXIMETRO_DESCONECTADO: new Audio('/AlertasIndex/oximetro_desconectado.wav'),
+            OXIMETRO_SIN_DATOS: new Audio('/AlertasIndex/oximetro_sin_datos.wav'),
+            RING_DESCONECTADO: new Audio('/AlertasIndex/ring_desconectado.wav'),
+            RING_SIN_DATOS: new Audio('/AlertasIndex/ring_sin_datos.wav'),
+            WT901_DESCONECTADO: new Audio('/AlertasIndex/wt901_desconectado.wav'),
+            WT901_SIN_DATOS: new Audio('/AlertasIndex/wt901_sin_datos.wav'),
+            SPO2_CRITICO: new Audio('/AlertasIndex/spo2_critica.wav'),
+            SPO2_ALERTA: new Audio('/AlertasIndex/spo2_alerta.wav'),
+            SPO2_PRECAUCION: new Audio('/AlertasIndex/spo2_precaucion.wav'),
+            SUPINO: new Audio('/AlertasIndex/boca_arriba.wav'),
+            API_ERROR: new Audio('/AlertasIndex/api_no_responde.wav')
+        };
+
+        function dispositivoHabilitado(nombre) {
+            if (nombre === 'oximetro') return document.getElementById('chkOximetro').checked;
+            if (nombre === 'wt901') return document.getElementById('chkWt901').checked;
+            if (nombre === 'ring') return document.getElementById('chkRing').checked;
+            return false;
+        }
+
+        async function cargarSeleccionDispositivos() {
+            try {
+                const resp = await fetch('/dispositivos', { cache: 'no-store' });
+                const data = await resp.json();
+
+                document.getElementById('chkOximetro').checked = data.oximetro === true;
+                document.getElementById('chkWt901').checked = data.wt901 === true;
+                document.getElementById('chkRing').checked = data.ring === true;
+
+                actualizarTextoDispositivos();
+            } catch { }
+        }
+
+        async function guardarSeleccionDispositivos() {
+            if (guardandoDispositivos) return;
+
+            guardandoDispositivos = true;
+
+            const payload = {
+                oximetro: document.getElementById('chkOximetro').checked,
+                wt901: document.getElementById('chkWt901').checked,
+                ring: document.getElementById('chkRing').checked
+            };
+
+            try {
+                await fetch('/dispositivos', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                supinoDesde = null;
+                actualizarTextoDispositivos();
+            } finally {
+                guardandoDispositivos = false;
+            }
+        }
+
+        function actualizarTextoDispositivos() {
+            const activos = [];
+
+            if (dispositivoHabilitado('oximetro')) activos.push('Oxímetro');
+            if (dispositivoHabilitado('wt901')) activos.push('WT901');
+            if (dispositivoHabilitado('ring')) activos.push('Ring');
+
+            document.getElementById('estadoDispositivos').innerText =
+                activos.length
+                    ? `Activos: ${activos.join(' + ')}`
+                    : 'Ningún dispositivo activo: no se generarán alertas de sensores.';
+        }
+
+        document.querySelectorAll('.device-check').forEach(x => {
+            x.addEventListener('change', guardarSeleccionDispositivos);
+        });
+
+        function activarAudio() {
+            audioActivo = true;
+
+            Object.values(sonidos).forEach(a => {
+                a.load();
+            });
+
+            detenerSonidos();
+
+            const btn = document.getElementById('btnAudio');
+            btn.innerText = 'Sonido activado';
+            btn.className = 'btn btn-success btn-lg';
+        }
+
+        function silenciar5Min() {
+            silenciadoHasta = Date.now() + 5 * 60 * 1000;
+            detenerSonidos();
+        }
+
+        function detenerSonidos() {
+            Object.values(sonidos).forEach(a => {
+                try {
+                    a.pause();
+                    a.currentTime = 0;
+                } catch { }
+            });
+        }
+
+        function evaluarFuenteSpo2(data) {
+            const ox = data.oximetro ?? {};
+            const ring = data.ring ?? {};
+
+            if (
+                dispositivoHabilitado('oximetro') &&
+                ox.spo2 !== null &&
+                ox.spo2 !== undefined
+            ) {
+                return {
+                    nombre: 'Oxímetro',
+                    spo2: Number(ox.spo2),
+                    pulso: ox.pulso
+                };
+            }
+
+            if (
+                dispositivoHabilitado('ring') &&
+                ring.spo2 !== null &&
+                ring.spo2 !== undefined
+            ) {
+                return {
+                    nombre: 'Ring',
+                    spo2: Number(ring.spo2),
+                    pulso: ring.pulso
+                };
+            }
+
+            return {
+                nombre: '--',
+                spo2: null,
+                pulso: null
+            };
+        }
+
+        function evaluarAlertas(data) {
+            const alertas = [];
+
+            const ox = data.oximetro ?? {};
+            const wt = data.wt901 ?? {};
+            const ring = data.ring ?? {};
+
+            const fuente = evaluarFuenteSpo2(data);
+
+            if (dispositivoHabilitado('oximetro')) {
+                const sinLecturaOx =
+                    data.segundosUltimaLecturaOximetro === null ||
+                    data.segundosUltimaLecturaOximetro === undefined ||
+                    data.segundosUltimaLecturaOximetro > 15;
+
+                if (ox.conectado !== true) {
+                    alertas.push({
+                        tipo: 'OXIMETRO_DESCONECTADO',
+                        prioridad: 100,
+                        texto: 'OXÍMETRO DESCONECTADO',
+                        clase: 'alert-danger',
+                        intervalo: 3000
+                    });
+                } else if (sinLecturaOx) {
+                    alertas.push({
+                        tipo: 'OXIMETRO_SIN_DATOS',
+                        prioridad: 95,
+                        texto: 'OXÍMETRO SIN DATOS > 15s',
+                        clase: 'alert-danger',
+                        intervalo: 3000
+                    });
+                }
+            }
+
+            if (dispositivoHabilitado('ring')) {
+                const sinLecturaRing =
+                    data.segundosUltimaLecturaRing === null ||
+                    data.segundosUltimaLecturaRing === undefined ||
+                    data.segundosUltimaLecturaRing > 45;
+
+                if (ring.conectado !== true) {
+                    alertas.push({
+                        tipo: 'RING_DESCONECTADO',
+                        prioridad: 98,
+                        texto: 'RING DESCONECTADO',
+                        clase: 'alert-danger',
+                        intervalo: 4000
+                    });
+                } else if (sinLecturaRing) {
+                    alertas.push({
+                        tipo: 'RING_SIN_DATOS',
+                        prioridad: 93,
+                        texto: 'RING SIN DATOS > 45s',
+                        clase: 'alert-danger',
+                        intervalo: 4000
+                    });
+                }
+            }
+
+            if (
+                fuente.spo2 !== null &&
+                fuente.spo2 !== undefined &&
+                fuente.spo2 > 20 &&
+                fuente.spo2 < 85
+            ) {
+                alertas.push({
+                    tipo: 'SPO2_CRITICO',
+                    prioridad: 90,
+                    texto: `SpO₂ CRÍTICA < 85% (${fuente.nombre})`,
+                    clase: 'alert-danger',
+                    intervalo: 2500
+                });
+            } else if (
+                fuente.spo2 !== null &&
+                fuente.spo2 !== undefined &&
+                fuente.spo2 >= 85 &&
+                fuente.spo2 < 90
+            ) {
+                alertas.push({
+                    tipo: 'SPO2_ALERTA',
+                    prioridad: 75,
+                    texto: `SpO₂ BAJA 85-89% (${fuente.nombre})`,
+                    clase: 'alert-danger',
+                    intervalo: 5000
+                });
+            } else if (
+                fuente.spo2 !== null &&
+                fuente.spo2 !== undefined &&
+                fuente.spo2 >= 90 &&
+                fuente.spo2 < 94
+            ) {
+                alertas.push({
+                    tipo: 'SPO2_PRECAUCION',
+                    prioridad: 50,
+                    texto: `SpO₂ PRECAUCIÓN 90-93% (${fuente.nombre})`,
+                    clase: 'alert-warning',
+                    intervalo: 12000
+                });
+            }
+
+            if (dispositivoHabilitado('wt901')) {
+                const sinLecturaWt =
+                    data.segundosUltimaLecturaWt901 === null ||
+                    data.segundosUltimaLecturaWt901 === undefined ||
+                    data.segundosUltimaLecturaWt901 > 15;
+
+                if (wt.conectado !== true) {
+                    alertas.push({
+                        tipo: 'WT901_DESCONECTADO',
+                        prioridad: 80,
+                        texto: 'WT901 DESCONECTADO',
+                        clase: 'alert-danger',
+                        intervalo: 6000
+                    });
+                } else if (sinLecturaWt) {
+                    alertas.push({
+                        tipo: 'WT901_SIN_DATOS',
+                        prioridad: 70,
+                        texto: 'WT901 SIN DATOS > 15s',
+                        clase: 'alert-warning',
+                        intervalo: 8000
+                    });
+                }
+
+                const supinoDetectado =
+                    data.nivelAlerta === 'SUPINO' ||
+                    wt.posicion === 'BOCA_ARRIBA' ||
+                    wt.alertaSupino === true;
+
+                const spo2Bajo94 =
+                    fuente.spo2 !== null &&
+                    fuente.spo2 !== undefined &&
+                    fuente.spo2 > 20 &&
+                    fuente.spo2 < 94;
+
+                if (supinoDetectado) {
+                    if (supinoDesde === null) {
+                        supinoDesde = Date.now();
+                    }
+
+                    if (
+                        Date.now() - supinoDesde >= SUPINO_CONFIRM_MS &&
+                        spo2Bajo94
+                    ) {
+                        alertas.push({
+                            tipo: 'SUPINO',
+                            prioridad: 85,
+                            texto: `BOCA ARRIBA > ${Math.floor(SUPINO_CONFIRM_MS / 1000)}s Y SpO₂ < 94%`,
+                            clase: 'alert-warning',
+                            intervalo: 5000
+                        });
+                    }
+                } else {
+                    supinoDesde = null;
+                }
+            } else {
+                supinoDesde = null;
+            }
+
+            return alertas.sort((a, b) => b.prioridad - a.prioridad);
+        }
+
+        function reproducirPatron(alertaPrincipal) {
+            if (!audioActivo || !alertaPrincipal) return;
+
+            if (Date.now() < silenciadoHasta) return;
+
+            const ahora = Date.now();
+
+            if (ahora - ultimoSonido < alertaPrincipal.intervalo) return;
+
+            ultimoSonido = ahora;
+
+            detenerSonidos();
+
+            const audio = sonidos[alertaPrincipal.tipo];
+
+            if (audio) {
+                try {
+                    audio.currentTime = 0;
+                    audio.play().catch(() => { });
+                } catch { }
+            }
+        }
+
+        function actualizarVisualAlertas(alertas) {
+            const alertaDiv = document.getElementById('alerta');
+
+            alertaDiv.className = 'alert text-center fs-4 fw-bold';
+            document.body.classList.remove('bg-light', 'bg-warning', 'bg-danger', 'bg-dark');
+
+            if (alertas.length === 0) {
+                alertaDiv.classList.add('alert-success');
+                alertaDiv.innerText = 'OK - Sin alertas';
+                document.body.classList.add('bg-light');
+                detenerSonidos();
+                return;
+            }
+
+            const principal = alertas[0];
+
+            alertaDiv.classList.add(principal.clase);
+            alertaDiv.innerText = 'ALERTA: ' + alertas.map(a => a.texto).join(' + ');
+
+            if (
+                [
+                    'OXIMETRO_DESCONECTADO',
+                    'OXIMETRO_SIN_DATOS',
+                    'RING_DESCONECTADO',
+                    'RING_SIN_DATOS',
+                    'SPO2_CRITICO'
+                ].includes(principal.tipo)
+            ) {
+                document.body.classList.add('bg-danger');
+            } else if (principal.tipo === 'SUPINO') {
+                document.body.classList.add('bg-warning');
+            } else {
+                document.body.classList.add('bg-light');
+            }
+        }
+
+        function txt(v, suf = '') {
+            return v !== null && v !== undefined ? v + suf : '--';
+        }
+
+        function fixed(v) {
+            return v !== null && v !== undefined ? Number(v).toFixed(2) : '--';
+        }
+
+        function estadoSensor(habilitado, sensor) {
+            if (!habilitado) return 'Deshabilitado';
+            return sensor?.conectado ? 'Conectado' : 'Reconectando / sin señal';
+        }
+
+        function ultima(habilitado, segundos) {
+            if (!habilitado) return 'No seleccionado';
+            return segundos !== null && segundos !== undefined
+                ? `Última lectura hace ${segundos}s`
+                : 'Sin lectura';
+        }
+
+        async function cargarEstado() {
+            try {
+                const resp = await fetch('/estado', { cache: 'no-store' });
+                const data = await resp.json();
+
+                document.getElementById('spo2').innerText = txt(data.oximetro?.spo2, '%');
+                document.getElementById('pulso').innerText = txt(data.oximetro?.pulso);
+                document.getElementById('estadoOximetro').innerText =
+                    estadoSensor(dispositivoHabilitado('oximetro'), data.oximetro);
+                document.getElementById('ultimaOximetro').innerText =
+                    ultima(dispositivoHabilitado('oximetro'), data.segundosUltimaLecturaOximetro);
+
+                document.getElementById('postura').innerText = data.wt901?.posicion ?? '--';
+                document.getElementById('pitch').innerText = fixed(data.wt901?.pitch);
+                document.getElementById('roll').innerText = fixed(data.wt901?.roll);
+                document.getElementById('yaw').innerText = fixed(data.wt901?.yaw);
+                document.getElementById('bateriaWt901').innerText = txt(data.wt901?.batteryRaw);
+                document.getElementById('estadoWt901').innerText =
+                    estadoSensor(dispositivoHabilitado('wt901'), data.wt901);
+                document.getElementById('ultimaWt901').innerText =
+                    ultima(dispositivoHabilitado('wt901'), data.segundosUltimaLecturaWt901);
+
+                document.getElementById('ringSpo2').innerText = txt(data.ring?.spo2, '%');
+                document.getElementById('ringPulso').innerText = txt(data.ring?.pulso);
+                document.getElementById('ringBateria').innerText = txt(data.ring?.bateria, '%');
+                document.getElementById('ringLecturas').innerText = txt(data.ring?.lecturasValidas);
+                document.getElementById('estadoRing').innerText =
+                    estadoSensor(dispositivoHabilitado('ring'), data.ring);
+                document.getElementById('ultimaRing').innerText =
+                    ultima(dispositivoHabilitado('ring'), data.segundosUltimaLecturaRing);
+
+                const alertas = evaluarAlertas(data);
+
+                actualizarVisualAlertas(alertas);
+
+                if (alertas.length > 0) {
+                    reproducirPatron(alertas[0]);
+                }
+
+                document.getElementById('json').innerText = JSON.stringify(data, null, 2);
+            } catch (e) {
+                const alertaDiv = document.getElementById('alerta');
+
+                alertaDiv.className = 'alert alert-danger text-center fs-4 fw-bold';
+                alertaDiv.innerText = 'No se pudo conectar con la API';
+
+                reproducirPatron({
+                    tipo: 'API_ERROR',
+                    prioridad: 100,
+                    texto: 'API NO RESPONDE',
+                    clase: 'alert-danger',
+                    intervalo: 3000
+                });
+            }
+        }
+
+        cargarSeleccionDispositivos().then(cargarEstado);
+        setInterval(cargarEstado, 1000);
+    </script>
+</body>
+</html>
