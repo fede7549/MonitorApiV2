@@ -45,12 +45,12 @@ public class RingWorker : BackgroundService
     private const byte CmdStatus = 0x52;
 
     private const int GreenWaitMs = 15000;
-    private const int MeasurementTimeoutSeconds = 30;
-    private const int DelayBetweenMeasurementsMs = 8000;
+    private const int MeasurementTimeoutSeconds = 180;
+    private const int DelayBetweenMeasurementsMs = 30000;
 
-    private const int CommunicationWatchdogSeconds = 45;
-    private const int ClinicalWatchdogSeconds = 120;
-    private const int MaxSessionWithoutValidReadingSeconds = 180;
+    private const int CommunicationWatchdogSeconds = 90;
+    private const int ClinicalWatchdogSeconds = 300;
+    private const int MaxSessionWithoutValidReadingSeconds = 300;
     private const int DeviceFailoverSeconds = 180;
 
     public RingWorker(
@@ -119,15 +119,25 @@ public class RingWorker : BackgroundService
                     {
                         _emptyMeasurementCycles++;
 
+                        var segundosDesdeComunicacion = SecondsSince(_lastCommunication);
+                        var hayComunicacionBleReciente = _lastCommunication != DateTime.MinValue &&
+                            segundosDesdeComunicacion <= CommunicationWatchdogSeconds;
+
                         _logger.LogWarning(
-                            "Ring: medición sin resultado clínico válido dentro de {Seconds}s. Ciclos vacíos={Cycles}. SegDesdeComunicacion={SegCom}s SegDesdeValido={SegValido}s",
+                            "Ring: sigue midiendo sin resultado clínico válido dentro de {Seconds}s. Ciclos vacíos={Cycles}. SegDesdeComunicacion={SegCom}s SegDesdeValido={SegValido}s. No se reinicia si BLE sigue vivo.",
                             MeasurementTimeoutSeconds,
                             _emptyMeasurementCycles,
-                            SecondsSince(_lastCommunication),
+                            segundosDesdeComunicacion,
                             SecondsSince(_lastValidClinicalReading));
 
-                        if (_emptyMeasurementCycles >= 1)
-                            throw new Exception("Ring conectado pero sin datos clínicos válidos por 1 ciclo");
+                        if (hayComunicacionBleReciente)
+                        {
+                            _store.SetRingMeasuring();
+                        }
+                        else
+                        {
+                            throw new Exception($"Ring sin comunicación BLE reciente durante medición. SegDesdeComunicacion={segundosDesdeComunicacion}");
+                        }
                     }
 
                     ThrowIfSessionIsStuck();
