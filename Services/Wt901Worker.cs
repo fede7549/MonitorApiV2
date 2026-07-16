@@ -34,7 +34,7 @@ public class Wt901Worker : BackgroundService
     private int? _pendingReadRegister;
 
     private const int WatchdogSeconds = 30;
-    private const int RegisterBatVal = 0x5C;
+    private const int RegisterBatVal = 0x64;
 
     // Si el WT901 preferido no logra datos estables después de este tiempo, cambia al otro WT901.
     // Mantengo watchdog interno de 30s para reconectar rápido, pero el cambio de dispositivo espera 180s.
@@ -50,8 +50,10 @@ public class Wt901Worker : BackgroundService
     private static readonly byte[] SetRate5HzCommand = { 0xFF, 0xAA, 0x03, 0x05, 0x00 };
 
     // Read register: FF AA 27 [REG_LOW] [REG_HIGH]
-    // BATVAL = 0x5C según SDK WitMotion
-    private static readonly byte[] ReadBatteryCommand = { 0xFF, 0xAA, 0x27, 0x5C, 0x00 };
+    // Registro de batería 0x64 según el protocolo BLE 5.0 de WitMotion
+    // y la implementación ben-wes/pd-witsensor:
+    // FF AA 27 64 00
+    private static readonly byte[] ReadBatteryCommand = { 0xFF, 0xAA, 0x27, 0x64, 0x00 };
 
     public Wt901Worker(
         MonitorStateStore store,
@@ -103,7 +105,7 @@ public class Wt901Worker : BackgroundService
                     if (_writeCharacteristic != null &&
                         DateTime.Now.Subtract(_lastBatteryRequest).TotalSeconds >= 60)
                     {
-                        await RequestBatteryAsync("Leer batería BATVAL 0x5C", stoppingToken);
+                        await RequestBatteryAsync("Leer batería registro 0x64", stoppingToken);
                     }
 
                     await Task.Delay(1000, stoppingToken);
@@ -195,7 +197,7 @@ public class Wt901Worker : BackgroundService
 
         // Pedimos batería una vez al conectar.
         await Task.Delay(300, token);
-        await RequestBatteryAsync("Leer batería inicial BATVAL 0x5C", token);
+        await RequestBatteryAsync("Leer batería inicial registro 0x64", token);
     }
 
     private async Task ConfigureNotifyAsync(GattDeviceService service, CancellationToken token)
@@ -406,9 +408,19 @@ public class Wt901Worker : BackgroundService
             if (data.Length == 0)
                 return;
 
+            // Respuesta BLE 5.0 de lectura de registros:
+            // 55 71 [regLo] [regHi] [valueLo] [valueHi] ... hasta completar 20 bytes.
+            // Para batería esperamos: 55 71 64 00 VL VH ...
+            if (data.Length >= 20 && data[0] == 0x55 && data[1] == 0x71)
+            {
+                ParseRegisterReadPacket55_71_20(data);
+
+                if (data.Length == 20)
+                    return;
+            }
+
             // Algunos WT901 BLE envían un paquete combinado de 20 bytes:
             // 55 61 + acc(6) + gyro(6) + angle(6)
-            // Lo manejamos antes del parser de frames de 11 bytes.
             if (data.Length >= 20 && data[0] == 0x55 && data[1] == 0x61)
             {
                 ParseCombinedAnglePacket(data);
@@ -462,29 +474,34 @@ public class Wt901Worker : BackgroundService
                     LogUnknownRaw("WT901 descartando basura antes de cabecera 55", discarded);
                 }
 
+                if (_rxBuffer.Count < 2)
+                    return;
+
+                byte type = _rxBuffer[1];
+
+                // En BLE 5.0 la respuesta 55-71 ocupa 20 bytes y puede llegar
+                // completa o fragmentada entre varias notificaciones.
+                if (type == 0x71)
+                {
+                    if (_rxBuffer.Count < 20)
+                        return;
+
+                    byte[] registerFrame = _rxBuffer.Take(20).ToArray();
+                    _rxBuffer.RemoveRange(0, 20);
+                    ParseRegisterReadPacket55_71_20(registerFrame);
+                    continue;
+                }
+
                 // Protocolo normal WitMotion: frames de 11 bytes:
                 // 55 [tipo] [8 bytes payload] [checksum]
                 if (_rxBuffer.Count < 11)
                     return;
 
                 byte[] frame = _rxBuffer.Take(11).ToArray();
-                byte type = frame[1];
-
                 bool checksumOk = IsValidWitChecksum(frame);
 
-                // Caso observado en tu log:
-                // 55-71-5C-00-00-00-00-00-00-00-00
-                // Viene como respuesta de registro, pero no respeta el checksum estándar.
-                // Para 55-71 aceptamos el frame completo si byte[2] trae el registro pedido.
                 if (!checksumOk)
                 {
-                    if (type == 0x71)
-                    {
-                        _rxBuffer.RemoveRange(0, 11);
-                        HandleWitFrame(frame);
-                        continue;
-                    }
-
                     LogUnknownRaw("WT901 frame con checksum inválido; se desplaza 1 byte", frame);
                     _rxBuffer.RemoveAt(0);
                     continue;
@@ -597,22 +614,27 @@ public class Wt901Worker : BackgroundService
 
         if (pending == RegisterBatVal && secondsSinceRequest <= 10)
         {
-            StoreBatteryRaw(value0, "55-5F", frame);
+            StoreBattery(value0, "55-5F", frame);
         }
     }
 
     private void ParseRegisterReadPacket55_71(byte[] frame)
     {
-        // Caso observado:
-        // 55 71 5C 00 00 00 00 00 00 00 00
-        // byte 2 = registro leído, byte 3-4 = valor little endian.
-        int register = frame[2];
-        ushort value = BitConverter.ToUInt16(frame, 3);
+        // Compatibilidad con respuestas cortas observadas anteriormente.
+        // Formato esperado: 55 71 64 00 VL VH ...
+        if (frame.Length < 6)
+        {
+            LogUnknownRaw("WT901 respuesta 55-71 demasiado corta", frame);
+            return;
+        }
+
+        ushort register = (ushort)(frame[2] | (frame[3] << 8));
+        ushort value = (ushort)(frame[4] | (frame[5] << 8));
 
         double secondsSinceRequest = SecondsSincePendingRead();
 
         _logger.LogInformation(
-            "WT901 REGVALUE 55-71 recibido | Reg=0x{Reg:X2} | SegDesdeReq={Seconds:F1} | Value={Value} | Hex={Hex}",
+            "WT901 REGVALUE 55-71 corto | Reg=0x{Reg:X4} | SegDesdeReq={Seconds:F1} | Value={Value} | Hex={Hex}",
             register,
             secondsSinceRequest,
             value,
@@ -620,7 +642,38 @@ public class Wt901Worker : BackgroundService
 
         if (register == RegisterBatVal)
         {
-            StoreBatteryRaw(value, "55-71", frame);
+            StoreBattery(value, "55-71 corto", frame);
+        }
+    }
+
+    private void ParseRegisterReadPacket55_71_20(byte[] data)
+    {
+        if (data.Length < 20)
+        {
+            LogUnknownRaw("WT901 respuesta BLE 55-71 incompleta", data);
+            return;
+        }
+
+        ushort register = (ushort)(data[2] | (data[3] << 8));
+        ushort value = (ushort)(data[4] | (data[5] << 8));
+        double secondsSinceRequest = SecondsSincePendingRead();
+
+        _logger.LogInformation(
+            "WT901 REGVALUE BLE 20 bytes | Reg=0x{Reg:X4} | SegDesdeReq={Seconds:F1} | Value={Value} | Hex={Hex}",
+            register,
+            secondsSinceRequest,
+            value,
+            BitConverter.ToString(data));
+
+        if (register == RegisterBatVal)
+        {
+            StoreBattery(value, "55-71 BLE 20 bytes", data);
+        }
+        else
+        {
+            LogUnknownRaw(
+                $"WT901 respuesta 55-71 para registro no esperado 0x{register:X4}",
+                data);
         }
     }
 
@@ -631,18 +684,87 @@ public class Wt901Worker : BackgroundService
             : DateTime.Now.Subtract(_pendingReadRegisterAt).TotalSeconds;
     }
 
-    private void StoreBatteryRaw(ushort raw, string sourceFrameType, byte[] frame)
+    private void StoreBattery(
+    ushort raw,
+    string sourceFrameType,
+    byte[] frame)
     {
-        _store.UpdateWt901BatteryRaw(raw);
+        // Algunos WT901 responden inicialmente con cero justo después
+        // de conectarse o configurar la frecuencia. No representa batería agotada.
+        if (raw == 0)
+        {
+            _logger.LogWarning(
+                "WT901 batería respondió RAW=0; lectura descartada. " +
+                "Se conservará el valor anterior y se volverá a consultar. " +
+                "FrameType={FrameType} | Hex={Hex}",
+                sourceFrameType,
+                BitConverter.ToString(frame));
+
+            _pendingReadRegister = null;
+            _pendingReadRegisterAt = DateTime.MinValue;
+
+            // Permite repetir la consulta en aproximadamente 5 segundos,
+            // en vez de esperar los 60 segundos normales.
+            _lastBatteryRequest = DateTime.Now.AddSeconds(-55);
+
+            return;
+        }
+
+        double volts = raw / 100.0;
+        int percentage = BatteryRawToPercentage(raw);
+
+        // Tu MonitorStateStore acepta ushort.
+        // Por ahora guardamos el porcentaje como ushort.
+        _store.UpdateWt901BatteryRaw((ushort)percentage);
 
         _logger.LogInformation(
-            "WT901 BATVAL detectado | Raw={Raw} | Registro=0x5C | FrameType={FrameType} | Hex={Hex}",
+            "WT901 BATERÍA | Raw={Raw} | Voltaje={Volts:F2}V | " +
+            "Porcentaje={Percentage}% | Registro=0x64 | " +
+            "FrameType={FrameType} | Hex={Hex}",
             raw,
+            volts,
+            percentage,
             sourceFrameType,
             BitConverter.ToString(frame));
 
         _pendingReadRegister = null;
         _pendingReadRegisterAt = DateTime.MinValue;
+    }
+
+    //private void StoreBattery(ushort raw, string sourceFrameType, byte[] frame)
+    //{
+    //    double volts = raw / 100.0;
+    //    int percentage = BatteryRawToPercentage(raw);
+
+    //    // Guardar el RAW
+    //    _store.UpdateWt901BatteryRaw(raw);
+
+    //    _logger.LogInformation(
+    //        "WT901 BATERÍA | Raw={Raw} | Voltaje={Volts:F2}V | Porcentaje={Percentage}% | Registro=0x64 | FrameType={FrameType} | Hex={Hex}",
+    //        raw,
+    //        volts,
+    //        percentage,
+    //        sourceFrameType,
+    //        BitConverter.ToString(frame));
+
+    //    _pendingReadRegister = null;
+    //    _pendingReadRegisterAt = DateTime.MinValue;
+    //}
+
+    private static int BatteryRawToPercentage(ushort raw)
+    {
+        if (raw > 396) return 100;
+        if (raw >= 393) return 90;
+        if (raw >= 387) return 75;
+        if (raw >= 382) return 60;
+        if (raw >= 379) return 50;
+        if (raw >= 377) return 40;
+        if (raw >= 373) return 30;
+        if (raw >= 370) return 20;
+        if (raw >= 368) return 15;
+        if (raw >= 350) return 10;
+        if (raw >= 340) return 5;
+        return 0;
     }
 
     private void LogAngles(double pitch, double roll, double yaw)

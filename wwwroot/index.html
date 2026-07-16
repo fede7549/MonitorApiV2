@@ -88,13 +88,29 @@
     </div>
 
     <script>
+        const API_URL = "/estado";
+
         let audioActivo = false;
         let ultimoSonido = 0;
         let silenciadoHasta = 0;
         let supinoDesde = null;
+        let spo2CriticoDesde = null;
+        let spo2AlertaDesde = null;
+        let spo2PrecaucionDesde = null;
+        let sinSpo2ConfiableDesde = null;
         let guardandoDispositivos = false;
+        let consultandoEstado = false;
+        let erroresApiConsecutivos = 0;
 
-        const SUPINO_CONFIRM_MS = 20000;
+
+        const SUPINO_CONFIRM_MS = 15000;
+        const SPO2_CRITICO_CONFIRM_MS = 3000;
+        const SPO2_ALERTA_CONFIRM_MS = 7000;
+        const SPO2_PRECAUCION_CONFIRM_MS = 12000;
+        const SIN_SPO2_CONFIABLE_CONFIRM_MS = 10000;
+        const MAX_ERRORES_API = 20;
+        const FETCH_TIMEOUT_MS = 2500;
+
 
         const sonidos = {
             OXIMETRO_DESCONECTADO: new Audio('/AlertasIndex/oximetro_desconectado.wav'),
@@ -120,6 +136,11 @@
         async function cargarSeleccionDispositivos() {
             try {
                 const resp = await fetch('/dispositivos', { cache: 'no-store' });
+
+                if (!resp.ok) {
+                    throw new Error(`HTTP ${resp.status}`);
+                }
+
                 const data = await resp.json();
 
                 document.getElementById('chkOximetro').checked = data.oximetro === true;
@@ -127,7 +148,12 @@
                 document.getElementById('chkRing').checked = data.ring === true;
 
                 actualizarTextoDispositivos();
-            } catch { }
+            } catch {
+                document.getElementById('chkOximetro').checked = false;
+                document.getElementById('chkWt901').checked = false;
+                document.getElementById('chkRing').checked = false;
+                actualizarTextoDispositivos();
+            }
         }
 
         async function guardarSeleccionDispositivos() {
@@ -142,14 +168,27 @@
             };
 
             try {
-                await fetch('/dispositivos', {
+                const resp = await fetch('/dispositivos', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
                 });
 
+                if (!resp.ok) {
+                    throw new Error(`HTTP ${resp.status}`);
+                }
+
                 supinoDesde = null;
+                spo2CriticoDesde = null;
+                spo2AlertaDesde = null;
+                spo2PrecaucionDesde = null;
+                sinSpo2ConfiableDesde = null;
+
                 actualizarTextoDispositivos();
+            } catch (e) {
+                const alertaDiv = document.getElementById('alerta');
+                alertaDiv.className = 'alert alert-danger text-center fs-4 fw-bold';
+                alertaDiv.innerText = 'No se pudo guardar la selección de dispositivos';
             } finally {
                 guardandoDispositivos = false;
             }
@@ -200,17 +239,149 @@
             });
         }
 
+        function obtenerPostura(data) {
+            return ((data.wt901 ?? {}).posicion ?? '').toString().toUpperCase();
+        }
+
+        function esPosturaLateral(data) {
+            const postura = obtenerPostura(data);
+
+            return postura.includes('LATERAL_DERECHO') ||
+                postura.includes('LATERAL_IZQUIERDO') ||
+                postura.includes('DERECHA') ||
+                postura.includes('IZQUIERDA') ||
+                postura.includes('DERECHO') ||
+                postura.includes('IZQUIERDO');
+        }
+
+        function lecturaOxReciente(data) {
+            const seg = data.segundosUltimaLecturaOximetro;
+            return seg !== null && seg !== undefined && Number(seg) <= 15;
+        }
+
+        function lecturaRingReciente(data) {
+            const seg = data.segundosUltimaLecturaRing;
+            return seg !== null && seg !== undefined && Number(seg) <= 180;
+        }
+
+        function lecturaWtReciente(data) {
+            const seg = data.segundosUltimaLecturaWt901;
+            return seg !== null && seg !== undefined && Number(seg) <= 15;
+        }
+
+        function oxConfiable(data) {
+            const ox = data.oximetro ?? {};
+
+            return dispositivoHabilitado('oximetro') &&
+                ox.conectado === true &&
+                ox.spo2 !== null &&
+                ox.spo2 !== undefined &&
+                Number(ox.spo2) > 20 &&
+                lecturaOxReciente(data);
+        }
+
+        function ringConfiable(data) {
+            const ring = data.ring ?? {};
+
+            return dispositivoHabilitado('ring') &&
+                ring.conectado === true &&
+                ring.spo2 !== null &&
+                ring.spo2 !== undefined &&
+                Number(ring.spo2) > 20 &&
+                lecturaRingReciente(data);
+        }
+
+        function wtConfiable(data) {
+            const wt = data.wt901 ?? {};
+
+            return dispositivoHabilitado('wt901') &&
+                wt.conectado === true &&
+                lecturaWtReciente(data);
+        }
+
+        function ringNormalYPosturaLateral(data) {
+            const ring = data.ring ?? {};
+
+            return ringConfiable(data) &&
+                wtConfiable(data) &&
+                Number(ring.spo2) >= 94 &&
+                esPosturaLateral(data);
+        }
+
+        function oximetroNormalYPosturaLateral(data) {
+            const ox = data.oximetro ?? {};
+
+            return oxConfiable(data) &&
+                wtConfiable(data) &&
+                Number(ox.spo2) >= 94 &&
+                esPosturaLateral(data);
+        }
+
+        function algunaFuenteSpo2Confiable(data) {
+            return oxConfiable(data) || ringConfiable(data);
+        }
+
+        function algunaFuenteSpo2Normal(data) {
+            const ox = data.oximetro ?? {};
+            const ring = data.ring ?? {};
+
+            return (oxConfiable(data) && Number(ox.spo2) >= 94) ||
+                (ringConfiable(data) && Number(ring.spo2) >= 94);
+        }
+
+        function oximetroNormal(data) {
+            const ox = data.oximetro ?? {};
+
+            return oxConfiable(data) &&
+                Number(ox.spo2) >= 94;
+        }
+
+        function ringNormal(data) {
+            const ring = data.ring ?? {};
+
+            return ringConfiable(data) &&
+                Number(ring.spo2) >= 94;
+        }
+
+        function alertaSoloVisual(tipo, prioridad, texto, clase = 'alert-warning') {
+            return {
+                tipo,
+                prioridad,
+                texto,
+                clase,
+                intervalo: 999999999,
+                audio: false
+            };
+        }
+
         function evaluarFuenteSpo2(data) {
             const ox = data.oximetro ?? {};
             const ring = data.ring ?? {};
 
+            if (oxConfiable(data)) {
+                return {
+                    nombre: 'Oxímetro',
+                    spo2: Number(ox.spo2),
+                    pulso: ox.pulso
+                };
+            }
+
+            if (ringConfiable(data)) {
+                return {
+                    nombre: 'Ring',
+                    spo2: Number(ring.spo2),
+                    pulso: ring.pulso
+                };
+            }
+
             if (
                 dispositivoHabilitado('oximetro') &&
                 ox.spo2 !== null &&
-                ox.spo2 !== undefined
+                ox.spo2 !== undefined &&
+                Number(ox.spo2) > 20
             ) {
                 return {
-                    nombre: 'Oxímetro',
+                    nombre: 'Oxímetro no reciente',
                     spo2: Number(ox.spo2),
                     pulso: ox.pulso
                 };
@@ -219,10 +390,11 @@
             if (
                 dispositivoHabilitado('ring') &&
                 ring.spo2 !== null &&
-                ring.spo2 !== undefined
+                ring.spo2 !== undefined &&
+                Number(ring.spo2) > 20
             ) {
                 return {
-                    nombre: 'Ring',
+                    nombre: 'Ring no reciente',
                     spo2: Number(ring.spo2),
                     pulso: ring.pulso
                 };
@@ -235,6 +407,20 @@
             };
         }
 
+        function confirmarCondicion(condicion, variableActual, tiempoMs) {
+            const ahora = Date.now();
+
+            if (!condicion) {
+                return { desde: null, confirmado: false };
+            }
+
+            const desde = variableActual ?? ahora;
+            return {
+                desde,
+                confirmado: ahora - desde >= tiempoMs
+            };
+        }
+
         function evaluarAlertas(data) {
             const alertas = [];
 
@@ -243,29 +429,74 @@
             const ring = data.ring ?? {};
 
             const fuente = evaluarFuenteSpo2(data);
+            const hayOxORingSeleccionado =
+                dispositivoHabilitado('oximetro') || dispositivoHabilitado('ring');
+
+            if (hayOxORingSeleccionado) {
+                const sinSpo2 = !algunaFuenteSpo2Confiable(data);
+                const confSinSpo2 = confirmarCondicion(
+                    sinSpo2,
+                    sinSpo2ConfiableDesde,
+                    SIN_SPO2_CONFIABLE_CONFIRM_MS
+                );
+
+                sinSpo2ConfiableDesde = confSinSpo2.desde;
+
+                if (confSinSpo2.confirmado) {
+                    alertas.push({
+                        tipo: 'OXIMETRO_SIN_DATOS',
+                        prioridad: 105,
+                        texto: 'SIN SpO₂ CONFIABLE: oxímetro/ring sin lectura útil',
+                        clase: 'alert-danger',
+                        intervalo: 3000
+                    });
+                }
+            } else {
+                sinSpo2ConfiableDesde = null;
+            }
 
             if (dispositivoHabilitado('oximetro')) {
                 const sinLecturaOx =
                     data.segundosUltimaLecturaOximetro === null ||
                     data.segundosUltimaLecturaOximetro === undefined ||
-                    data.segundosUltimaLecturaOximetro > 15;
+                    Number(data.segundosUltimaLecturaOximetro) > 15;
 
                 if (ox.conectado !== true) {
-                    alertas.push({
-                        tipo: 'OXIMETRO_DESCONECTADO',
-                        prioridad: 100,
-                        texto: 'OXÍMETRO DESCONECTADO',
-                        clase: 'alert-danger',
-                        intervalo: 3000
-                    });
+                    if (ringNormal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'OXIMETRO_DESCONECTADO',
+                            15,
+                            wtConfiable(data) && esPosturaLateral(data)
+                                ? `Oxímetro desconectado, pero ring ${ring.spo2}% y postura lateral`
+                                : `Oxímetro desconectado, pero ring ${ring.spo2}% está normal`
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'OXIMETRO_DESCONECTADO',
+                            prioridad: 96,
+                            texto: 'OXÍMETRO DESCONECTADO',
+                            clase: 'alert-danger',
+                            intervalo: 4000
+                        });
+                    }
                 } else if (sinLecturaOx) {
-                    alertas.push({
-                        tipo: 'OXIMETRO_SIN_DATOS',
-                        prioridad: 95,
-                        texto: 'OXÍMETRO SIN DATOS > 15s',
-                        clase: 'alert-danger',
-                        intervalo: 3000
-                    });
+                    if (ringNormal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'OXIMETRO_SIN_DATOS',
+                            15,
+                            wtConfiable(data) && esPosturaLateral(data)
+                                ? `Oxímetro sin datos > 15s, pero ring ${ring.spo2}% y postura lateral`
+                                : `Oxímetro sin datos > 15s, pero ring ${ring.spo2}% está normal`
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'OXIMETRO_SIN_DATOS',
+                            prioridad: 92,
+                            texto: 'OXÍMETRO SIN DATOS > 15s',
+                            clase: 'alert-danger',
+                            intervalo: 4000
+                        });
+                    }
                 }
             }
 
@@ -273,90 +504,203 @@
                 const sinLecturaRing =
                     data.segundosUltimaLecturaRing === null ||
                     data.segundosUltimaLecturaRing === undefined ||
-                    data.segundosUltimaLecturaRing > 45;
+                    Number(data.segundosUltimaLecturaRing) > 180;
 
                 if (ring.conectado !== true) {
-                    alertas.push({
-                        tipo: 'RING_DESCONECTADO',
-                        prioridad: 98,
-                        texto: 'RING DESCONECTADO',
-                        clase: 'alert-danger',
-                        intervalo: 4000
-                    });
+                    if (oximetroNormal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'RING_DESCONECTADO',
+                            15,
+                            wtConfiable(data) && esPosturaLateral(data)
+                                ? `Ring desconectado, pero oxímetro ${ox.spo2}% y postura lateral`
+                                : `Ring desconectado, pero oxímetro ${ox.spo2}% está normal`
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'RING_DESCONECTADO',
+                            prioridad: 94,
+                            texto: 'RING DESCONECTADO',
+                            clase: 'alert-danger',
+                            intervalo: 5000
+                        });
+                    }
                 } else if (sinLecturaRing) {
-                    alertas.push({
-                        tipo: 'RING_SIN_DATOS',
-                        prioridad: 93,
-                        texto: 'RING SIN DATOS > 45s',
-                        clase: 'alert-danger',
-                        intervalo: 4000
-                    });
+                    if (oximetroNormal(data) && wtConfiable(data) && esPosturaLateral(data)) {
+                        // Ring sin datos, pero hay respaldo confiable: oxímetro normal y postura lateral.
+                        // No mostrar alerta ni aviso para evitar falsas alarmas.
+                    } else if (oximetroNormal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'RING_SIN_DATOS',
+                            15,
+                            `Ring sin datos > 180s, pero oxímetro ${ox.spo2}% está normal`
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'RING_SIN_DATOS',
+                            prioridad: 90,
+                            texto: 'RING SIN DATOS > 180s',
+                            clase: 'alert-danger',
+                            intervalo: 5000
+                        });
+                    }
                 }
             }
 
-            if (
+            const spo2Valida =
                 fuente.spo2 !== null &&
                 fuente.spo2 !== undefined &&
-                fuente.spo2 > 20 &&
-                fuente.spo2 < 85
-            ) {
+                Number(fuente.spo2) > 20;
+
+            const spo2Menor80 = spo2Valida && fuente.spo2 < 80;
+            const spo2Critico = spo2Valida && fuente.spo2 >= 80 && fuente.spo2 < 85;
+            const spo2Alerta = spo2Valida && fuente.spo2 >= 85 && fuente.spo2 < 90;
+            const spo2Precaucion = spo2Valida && fuente.spo2 >= 90 && fuente.spo2 < 94;
+
+            const confCritico = confirmarCondicion(
+                spo2Critico,
+                spo2CriticoDesde,
+                SPO2_CRITICO_CONFIRM_MS
+            );
+            spo2CriticoDesde = confCritico.desde;
+
+            const confAlerta = confirmarCondicion(
+                spo2Alerta,
+                spo2AlertaDesde,
+                SPO2_ALERTA_CONFIRM_MS
+            );
+            spo2AlertaDesde = confAlerta.desde;
+
+            const confPrecaucion = confirmarCondicion(
+                spo2Precaucion,
+                spo2PrecaucionDesde,
+                SPO2_PRECAUCION_CONFIRM_MS
+            );
+            spo2PrecaucionDesde = confPrecaucion.desde;
+
+            const supinoDetectadoActual =
+                dispositivoHabilitado('wt901') &&
+                (
+                    data.nivelAlerta === 'SUPINO' ||
+                    wt.posicion === 'BOCA_ARRIBA' ||
+                    wt.alertaSupino === true
+                );
+
+            const oxBajoPeroRingNormal =
+                spo2Valida &&
+                fuente.nombre.startsWith('Oxímetro') &&
+                fuente.spo2 < 94 &&
+                ringNormal(data) &&
+                !supinoDetectadoActual;
+
+            const ringBajoPeroOxNormal =
+                spo2Valida &&
+                fuente.nombre.startsWith('Ring') &&
+                fuente.spo2 < 94 &&
+                oximetroNormal(data) &&
+                !supinoDetectadoActual;
+
+            if (oxBajoPeroRingNormal) {
+                spo2CriticoDesde = null;
+                spo2AlertaDesde = null;
+                spo2PrecaucionDesde = null;
+
+                alertas.push(alertaSoloVisual(
+                    'SPO2_PRECAUCION',
+                    18,
+                    `Oxímetro ${fuente.spo2}% pero ring normal (${ring.spo2}%). Posible movimiento del dedo o lectura falsa del oxímetro.`
+                ));
+            } else if (ringBajoPeroOxNormal) {
+                spo2CriticoDesde = null;
+                spo2AlertaDesde = null;
+                spo2PrecaucionDesde = null;
+
+                alertas.push(alertaSoloVisual(
+                    'SPO2_PRECAUCION',
+                    18,
+                    `Ring ${fuente.spo2}% pero oxímetro normal (${ox.spo2}%). Posible lectura dudosa del ring.`
+                ));
+            } else if (spo2Menor80 || confCritico.confirmado) {
                 alertas.push({
                     tipo: 'SPO2_CRITICO',
-                    prioridad: 90,
-                    texto: `SpO₂ CRÍTICA < 85% (${fuente.nombre})`,
+                    prioridad: 100,
+                    texto: `SpO₂ CRÍTICA < 85% (${fuente.nombre}: ${fuente.spo2}%)`,
                     clase: 'alert-danger',
                     intervalo: 2500
                 });
-            } else if (
-                fuente.spo2 !== null &&
-                fuente.spo2 !== undefined &&
-                fuente.spo2 >= 85 &&
-                fuente.spo2 < 90
-            ) {
+            } else if (confAlerta.confirmado) {
                 alertas.push({
                     tipo: 'SPO2_ALERTA',
-                    prioridad: 75,
-                    texto: `SpO₂ BAJA 85-89% (${fuente.nombre})`,
+                    prioridad: 85,
+                    texto: `SpO₂ BAJA 85-89% sostenida (${fuente.nombre}: ${fuente.spo2}%)`,
                     clase: 'alert-danger',
                     intervalo: 5000
                 });
-            } else if (
-                fuente.spo2 !== null &&
-                fuente.spo2 !== undefined &&
-                fuente.spo2 >= 90 &&
-                fuente.spo2 < 94
-            ) {
-                alertas.push({
-                    tipo: 'SPO2_PRECAUCION',
-                    prioridad: 50,
-                    texto: `SpO₂ PRECAUCIÓN 90-93% (${fuente.nombre})`,
-                    clase: 'alert-warning',
-                    intervalo: 12000
-                });
+            } else if (confPrecaucion.confirmado) {
+                if (fuente.nombre.startsWith('Oxímetro') && ringNormal(data)) {
+                    alertas.push(alertaSoloVisual(
+                        'SPO2_PRECAUCION',
+                        20,
+                        wtConfiable(data) && esPosturaLateral(data)
+                            ? `Oxímetro ${fuente.spo2}% pero ring normal (${ring.spo2}%) y postura lateral. Posible movimiento.`
+                            : `Oxímetro ${fuente.spo2}% pero ring normal (${ring.spo2}%). Posible movimiento.`
+                    ));
+                } else if (fuente.nombre.startsWith('Ring') && oximetroNormal(data)) {
+                    alertas.push(alertaSoloVisual(
+                        'SPO2_PRECAUCION',
+                        20,
+                        wtConfiable(data) && esPosturaLateral(data)
+                            ? `Ring ${fuente.spo2}% pero oxímetro normal (${ox.spo2}%) y postura lateral. Posible lectura dudosa.`
+                            : `Ring ${fuente.spo2}% pero oxímetro normal (${ox.spo2}%). Posible lectura dudosa.`
+                    ));
+                } else {
+                    alertas.push({
+                        tipo: 'SPO2_PRECAUCION',
+                        prioridad: 45,
+                        texto: `SpO₂ PRECAUCIÓN 90-93% sostenida (${fuente.nombre}: ${fuente.spo2}%)`,
+                        clase: 'alert-warning',
+                        intervalo: 15000
+                    });
+                }
             }
 
             if (dispositivoHabilitado('wt901')) {
                 const sinLecturaWt =
                     data.segundosUltimaLecturaWt901 === null ||
                     data.segundosUltimaLecturaWt901 === undefined ||
-                    data.segundosUltimaLecturaWt901 > 15;
+                    Number(data.segundosUltimaLecturaWt901) > 15;
 
                 if (wt.conectado !== true) {
-                    alertas.push({
-                        tipo: 'WT901_DESCONECTADO',
-                        prioridad: 80,
-                        texto: 'WT901 DESCONECTADO',
-                        clase: 'alert-danger',
-                        intervalo: 6000
-                    });
+                    if (algunaFuenteSpo2Normal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'WT901_DESCONECTADO',
+                            10,
+                            'WT901 desconectado, pero SpO₂ está normal'
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'WT901_DESCONECTADO',
+                            prioridad: 65,
+                            texto: 'WT901 DESCONECTADO',
+                            clase: 'alert-warning',
+                            intervalo: 15000
+                        });
+                    }
                 } else if (sinLecturaWt) {
-                    alertas.push({
-                        tipo: 'WT901_SIN_DATOS',
-                        prioridad: 70,
-                        texto: 'WT901 SIN DATOS > 15s',
-                        clase: 'alert-warning',
-                        intervalo: 8000
-                    });
+                    if (algunaFuenteSpo2Normal(data)) {
+                        alertas.push(alertaSoloVisual(
+                            'WT901_SIN_DATOS',
+                            10,
+                            'WT901 sin datos > 15s, pero SpO₂ está normal'
+                        ));
+                    } else {
+                        alertas.push({
+                            tipo: 'WT901_SIN_DATOS',
+                            prioridad: 60,
+                            texto: 'WT901 SIN DATOS > 15s',
+                            clase: 'alert-warning',
+                            intervalo: 15000
+                        });
+                    }
                 }
 
                 const supinoDetectado =
@@ -365,9 +709,7 @@
                     wt.alertaSupino === true;
 
                 const spo2Bajo94 =
-                    fuente.spo2 !== null &&
-                    fuente.spo2 !== undefined &&
-                    fuente.spo2 > 20 &&
+                    spo2Valida &&
                     fuente.spo2 < 94;
 
                 if (supinoDetectado) {
@@ -381,9 +723,9 @@
                     ) {
                         alertas.push({
                             tipo: 'SUPINO',
-                            prioridad: 85,
-                            texto: `BOCA ARRIBA > ${Math.floor(SUPINO_CONFIRM_MS / 1000)}s Y SpO₂ < 94%`,
-                            clase: 'alert-warning',
+                            prioridad: 98,
+                            texto: `URGENTE: BOCA ARRIBA > ${Math.floor(SUPINO_CONFIRM_MS / 1000)}s Y SpO₂ ${fuente.spo2}% < 94%`,
+                            clase: 'alert-danger',
                             intervalo: 5000
                         });
                     }
@@ -399,6 +741,7 @@
 
         function reproducirPatron(alertaPrincipal) {
             if (!audioActivo || !alertaPrincipal) return;
+            if (alertaPrincipal.audio === false) return;
 
             if (Date.now() < silenciadoHasta) return;
 
@@ -437,20 +780,28 @@
             const principal = alertas[0];
 
             alertaDiv.classList.add(principal.clase);
-            alertaDiv.innerText = 'ALERTA: ' + alertas.map(a => a.texto).join(' + ');
+
+            const esSoloVisual = alertas.every(a => a.audio === false || a.prioridad < 80);
+
+            alertaDiv.innerText =
+                esSoloVisual
+                    ? 'AVISO: ' + alertas.map(a => a.texto).join(' + ')
+                    : 'ALERTA: ' + alertas.map(a => a.texto).join(' + ');
 
             if (
+                !esSoloVisual &&
                 [
                     'OXIMETRO_DESCONECTADO',
                     'OXIMETRO_SIN_DATOS',
                     'RING_DESCONECTADO',
                     'RING_SIN_DATOS',
-                    'SPO2_CRITICO'
-                ].includes(principal.tipo)
+                    'SPO2_CRITICO',
+                    'SPO2_ALERTA',
+                    'SUPINO'
+                ].includes(principal.tipo) &&
+                principal.prioridad >= 80
             ) {
                 document.body.classList.add('bg-danger');
-            } else if (principal.tipo === 'SUPINO') {
-                document.body.classList.add('bg-warning');
             } else {
                 document.body.classList.add('bg-light');
             }
@@ -477,9 +828,27 @@
         }
 
         async function cargarEstado() {
+            if (consultandoEstado) return;
+
+            consultandoEstado = true;
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
             try {
-                const resp = await fetch('/estado', { cache: 'no-store' });
+                const resp = await fetch(API_URL, {
+                    cache: 'no-store',
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeoutId);
+
+                if (!resp.ok) {
+                    throw new Error(`HTTP ${resp.status}`);
+                }
+
                 const data = await resp.json();
+                erroresApiConsecutivos = 0;
 
                 document.getElementById('spo2').innerText = txt(data.oximetro?.spo2, '%');
                 document.getElementById('pulso').innerText = txt(data.oximetro?.pulso);
@@ -517,10 +886,23 @@
 
                 document.getElementById('json').innerText = JSON.stringify(data, null, 2);
             } catch (e) {
+                clearTimeout(timeoutId);
+
+                erroresApiConsecutivos++;
+
                 const alertaDiv = document.getElementById('alerta');
+                document.body.classList.remove('bg-light', 'bg-warning', 'bg-danger', 'bg-dark');
+
+                if (erroresApiConsecutivos < MAX_ERRORES_API) {
+                    alertaDiv.className = 'alert alert-warning text-center fs-4 fw-bold';
+                    alertaDiv.innerText = `Esperando API... (${erroresApiConsecutivos}/${MAX_ERRORES_API})`;
+                    document.body.classList.add('bg-light');
+                    return;
+                }
 
                 alertaDiv.className = 'alert alert-danger text-center fs-4 fw-bold';
-                alertaDiv.innerText = 'No se pudo conectar con la API';
+                alertaDiv.innerText = `No se pudo conectar con la API (${erroresApiConsecutivos} fallos seguidos)`;
+                document.body.classList.add('bg-danger');
 
                 reproducirPatron({
                     tipo: 'API_ERROR',
@@ -529,6 +911,8 @@
                     clase: 'alert-danger',
                     intervalo: 3000
                 });
+            } finally {
+                consultandoEstado = false;
             }
         }
 
